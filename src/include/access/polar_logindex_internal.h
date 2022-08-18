@@ -151,6 +151,7 @@
 		LOG_INDEX_MEM_TBL_SET_STATE((active), LOG_INDEX_MEM_TBL_STATE_ACTIVE); \
 	}
 
+//XI: Check whether table's free head reaches maximum(default 4096)
 #define LOG_INDEX_MEM_TBL_FULL(t)  \
 	(LOG_INDEX_MEM_TBL_FREE_HEAD(t) == LOG_INDEX_MEM_TBL_SEG_NUM)
 
@@ -496,6 +497,8 @@ log_index_item_seg(log_idx_table_data_t *table, log_seg_id_t seg)
 		elog(PANIC, "Incorrect seg=%u to get logindex segment", seg);
 	}
 
+    // XI: (t)->segment[(seg)-1].item_seg)
+    // segment is a union: item_seg and item_head
 	return LOG_INDEX_ITEM_SEG(table, seg);
 }
 #endif

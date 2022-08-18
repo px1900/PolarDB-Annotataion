@@ -45,12 +45,17 @@ static int                      logindex_errno = 0;
 static void log_index_insert_new_item(log_index_lsn_t *lsn_info, log_mem_table_t *table, uint32 key, log_seg_id_t new_item_id);
 static void log_index_insert_new_seg(log_mem_table_t *table, log_seg_id_t head, log_seg_id_t seg_id, log_index_lsn_t *lsn_info);
 
+// Xi: check whether snapshot has this state
+// States includes: POLAR_LOGINDEX_STATE_INITIALIZED,
+//                  POLAR_LOGINDEX_STATE_ADDING,
+//                  POLAR_LOGINDEX_STATE_WRITABLE
 bool
 polar_logindex_check_state(log_index_snapshot_t *logindex_snapshot, uint32 state)
 {
 	return pg_atomic_read_u32(&logindex_snapshot->state) & state;
 }
 
+// Xi: If Context exists, return it. Otherwise, create and return it.
 MemoryContext
 polar_logindex_memory_context(void)
 {
@@ -72,15 +77,18 @@ log_index_item_max_lsn(log_idx_table_data_t *table, log_item_head_t *item)
 {
 	log_item_seg_t *seg;
 
+    //XI: if there is only head node, get the last record in suffix_lsn[] list
 	if (item->head_seg == item->tail_seg)
 		return LOG_INDEX_SEG_MAX_LSN(table, item);
 
+    // XI: search the list tail item, that item has the max LSN
 	seg = log_index_item_seg(table, item->tail_seg);
 	Assert(seg != NULL);
 
 	return LOG_INDEX_SEG_MAX_LSN(table, seg);
 }
 
+// XI: One snapShot has many logIndexMemTables
 static Size
 log_index_mem_tbl_shmem_size(uint64 logindex_mem_tbl_size)
 {
@@ -97,6 +105,7 @@ log_index_mem_tbl_shmem_size(uint64 logindex_mem_tbl_size)
 
 	return size;
 }
+
 
 static Size
 log_index_bloom_shmem_size(int bloom_blocks)
@@ -128,6 +137,9 @@ polar_logindex_shmem_size(uint64 logindex_mem_tbl_size, int bloom_blocks)
 	return CACHELINEALIGN(size);
 }
 
+//XI: What is "promote", maybe it means the process that primary node write LogIndex to disk
+//XI: This function reflect whether this table has been saved
+//XI: Get promoted_info from snapshot. If promoted_info shows $table->tid has been saved, return true
 static bool
 log_index_table_saved_before_promote(log_index_snapshot_t *logindex_snapshot, log_mem_table_t *table)
 {
@@ -498,6 +510,7 @@ polar_logindex_snapshot_base_init(log_index_snapshot_t *logindex_snapshot, XLogR
 
 	POLAR_LOG_LOGINDEX_META_INFO(meta);
 
+    //XI: there are max_idx_table_id tables created, and the tables will be set inactive in mem_tbl_size size
 	logindex_snapshot_init_promoted_info(logindex_snapshot);
 	logindex_snapshot->max_idx_table_id = meta->max_idx_table_id;
 	LOG_INDEX_MEM_TBL_ACTIVE_ID = meta->max_idx_table_id % logindex_snapshot->mem_tbl_size;
@@ -693,6 +706,7 @@ log_index_data_compatible(log_index_meta_t *meta)
 	}
 }
 
+//XI: Read meta file("log_index_meta") from disk and validate data
 bool
 log_index_get_meta(log_index_snapshot_t *logindex_snapshot, log_index_meta_t *meta)
 {
@@ -762,6 +776,7 @@ log_index_get_meta(log_index_snapshot_t *logindex_snapshot, log_index_meta_t *me
 	return true;
 }
 
+//XI: Return meta.start_lsn
 XLogRecPtr
 polar_logindex_start_lsn(logindex_snapshot_t logindex_snapshot)
 {
@@ -777,6 +792,8 @@ polar_logindex_start_lsn(logindex_snapshot_t logindex_snapshot)
 	return start_lsn;
 }
 
+// XI: Write and Sync meta to disk
+// snapshot only provides with meta_path directory
 void
 polar_log_index_write_meta(log_index_snapshot_t *logindex_snapshot, log_index_meta_t *meta, bool update)
 {
@@ -832,6 +849,11 @@ polar_log_index_write_meta(log_index_snapshot_t *logindex_snapshot, log_index_me
  * During master recovery, bgwriter is not started and we have to
  * synchronized save table to get active table.
  */
+//XI: If this snapshot is not WRITABLE, check meta whether this table has been saved,
+//      if so, invalidate this table's bloom data and set table as FLUSHED
+//    If this snapshot is WRITABLE and this table is flushable, check promoted_info,
+//      if this table has been save to shared disk, do nothing, just set state as FLUSHED,
+//      else, write table data and bloom data to disk
 void
 log_index_force_save_table(log_index_snapshot_t *logindex_snapshot, log_mem_table_t *table)
 {
@@ -851,6 +873,7 @@ log_index_force_save_table(log_index_snapshot_t *logindex_snapshot, log_mem_tabl
 
 		LWLockAcquire(LOG_INDEX_IO_LOCK, LW_EXCLUSIVE);
 
+        //XI: get the max_tid that have been saved
 		if (log_index_get_meta(logindex_snapshot, meta))
 			max_tid = meta->max_idx_table_id;
 		else
@@ -858,6 +881,8 @@ log_index_force_save_table(log_index_snapshot_t *logindex_snapshot, log_mem_tabl
 
 		LWLockRelease(LOG_INDEX_IO_LOCK);
 
+        //XI: if meta shows this table has been saved, invalidate this table's bloom data, and set
+        //      this table state as FLUSHED
 		if (max_tid >= LOG_INDEX_MEM_TBL_TID(table))
 		{
 			polar_logindex_invalid_bloom_cache(logindex_snapshot, LOG_INDEX_MEM_TBL_TID(table));
@@ -870,12 +895,13 @@ log_index_force_save_table(log_index_snapshot_t *logindex_snapshot, log_mem_tabl
 		{
 			bool succeed = false;
 
+            //XI: if this table has already been save, just ignore it and set state as FLUSHED
 			if (log_index_table_saved_before_promote(logindex_snapshot, table))
 			{
 				succeed = true;
 				LOG_INDEX_MEM_TBL_SET_STATE(table, LOG_INDEX_MEM_TBL_STATE_FLUSHED);
 			}
-			else if (log_index_write_table(logindex_snapshot, table))
+			else if (log_index_write_table(logindex_snapshot, table)) //XI: Write table data and bloom data to disk
 				succeed = true;
 
 			if (!succeed)
@@ -890,6 +916,9 @@ log_index_force_save_table(log_index_snapshot_t *logindex_snapshot, log_mem_tabl
 	NOTIFY_LOGINDEX_BG_WORKER(logindex_snapshot->bg_worker_latch);
 }
 
+//XI: if the table is inactive, flush table data to disk (state:FLUSHED)
+//      then memset this table to all 0 (state:FREE)
+//      then use parameter lsn to initialize this table's prefix LSN (state:ACTIVE)
 static void
 log_index_wait_active(log_index_snapshot_t *logindex_snapshot, log_mem_table_t *table, XLogRecPtr lsn)
 {
@@ -910,15 +939,21 @@ log_index_wait_active(log_index_snapshot_t *logindex_snapshot, log_mem_table_t *
 		 * We only save table to storage when polar_streaming_xlog_meta is true.
 		 * If the table we are waiting is inactive then force to save it in this process.
 		 */
+        //XI: if this table is inactive, and snapshot is WRITABLE, save table data and bloom data to disk
+        //      and set its state as FLUSHED
 		if (LOG_INDEX_MEM_TBL_STATE(table) == LOG_INDEX_MEM_TBL_STATE_INACTIVE)
 			log_index_force_save_table(logindex_snapshot, table);
 
+        //XI: after this page is flushed, clear this table
 		if (LOG_INDEX_MEM_TBL_STATE(table) == LOG_INDEX_MEM_TBL_STATE_FLUSHED)
 			MemSet(table, 0, sizeof(log_mem_table_t));
 
+        //XI: the state will be FREE (0x00) after memset(0)
+        //XI: Set table state as ACTIVE, and set this table's prefix lsn, and set free_head as 1
 		if (LOG_INDEX_MEM_TBL_STATE(table) == LOG_INDEX_MEM_TBL_STATE_FREE)
 			LOG_INDEX_MEM_TBL_NEW_ACTIVE(table, lsn);
 
+        //XI: If the previous processes are successful, it's time to break the loop
 		if (LOG_INDEX_MEM_TBL_STATE(table) == LOG_INDEX_MEM_TBL_STATE_ACTIVE
 				&& !LOG_INDEX_MEM_TBL_FULL(table))
 			end = true;
@@ -937,13 +972,17 @@ log_index_wait_active(log_index_snapshot_t *logindex_snapshot, log_mem_table_t *
 	}
 }
 
+// XI: iterate all the head with "key", (hash conflict)
+// XI: if this page doesn't exist in this table, return value is NULL
 static log_seg_id_t
 log_index_mem_tbl_exists_page(BufferTag *tag,
 							  log_idx_table_data_t *table, uint32 key)
 {
+    //XI: if the key doesn't exist in this table, then $exists is NULL
 	log_seg_id_t    exists = LOG_INDEX_TBL_SLOT_VALUE(table, key);
 	log_item_head_t *item;
 
+    //XI: if the key doesn't exist in this page, then $item is NULL
 	item = log_index_item_head(table, exists);
 
 	while (item != NULL &&
@@ -956,6 +995,9 @@ log_index_mem_tbl_exists_page(BufferTag *tag,
 	return exists;
 }
 
+//XI: Check whether node is full
+//XI: Caller will depend on this to determine whether insert a new node
+//XI: When the list's last node contains maximum records. (2 in head and 10 in segment)
 static bool
 log_index_mem_seg_full(log_mem_table_t *table, log_seg_id_t head)
 {
@@ -966,6 +1008,7 @@ log_index_mem_seg_full(log_mem_table_t *table, log_seg_id_t head)
 
 	item = log_index_item_head(&table->data, head);
 
+    // XI: the head list only has one head element
 	if (item->tail_seg == head)
 	{
 		if (item->number == LOG_INDEX_ITEM_HEAD_LSN_NUM)
@@ -973,6 +1016,8 @@ log_index_mem_seg_full(log_mem_table_t *table, log_seg_id_t head)
 	}
 	else
 	{
+        // XI: The tail segments is No.($seg->number).
+        // If it reached the maximum of this segment, return true
 		seg = log_index_item_seg(&table->data, item->tail_seg);
 		Assert(seg != NULL);
 
@@ -983,15 +1028,21 @@ log_index_mem_seg_full(log_mem_table_t *table, log_seg_id_t head)
 	return false;
 }
 
+//XI: Insert a new page to LogIndex
+//XI: Insert a new head into current active table
+//XI: update active_table segment[] list (set new_item_id as a new head)
+//XI: update active_table hash[] list, if no hash_conflict
 static void
 log_index_insert_new_item(log_index_lsn_t *lsn_info,
 						  log_mem_table_t *table, uint32 key,
 						  log_seg_id_t new_item_id)
 {
+    //XI: get segment[new_item_id] as new-head from the active table (already assigned in the caller by free_head++)
 	log_item_head_t *new_item = log_index_item_head(&table->data, new_item_id);
 	log_seg_id_t   *slot;
 
 	Assert(key < LOG_INDEX_MEM_TBL_HASH_NUM);
+    //XI: the hash[] will store the first segment_id inserting with same key
 	slot = LOG_INDEX_TBL_SLOT(&table->data, key);
 
 	new_item->head_seg = new_item_id;
@@ -1001,17 +1052,22 @@ log_index_insert_new_item(log_index_lsn_t *lsn_info,
 	memcpy(&(new_item->tag), lsn_info->tag, sizeof(BufferTag));
 	new_item->number = 1;
 	new_item->prev_page_lsn = lsn_info->prev_lsn;
+    //XI: Set head Suffix LSN[0] as lsn_info.lsn's suffix LSN
 	LOG_INDEX_INSERT_LSN_INFO(new_item, 0, lsn_info);
 
+    //XI: If there are other pages have same key (in the same slot)
 	if (*slot == LOG_INDEX_TBL_INVALID_SEG)
 		*slot = new_item_id;
-	else
+	else // XI: Create a new slot
 	{
 		new_item->next_item = *slot;
 		*slot = new_item_id;
 	}
 }
 
+//XI: Get table->seg[ $seg_id ] as a new segment node
+//XI: add this new segment node in the head list
+//XI: set $new_seg->suffix_lsn[0] = lsn_info.suffix_lsn
 static void
 log_index_insert_new_seg(log_mem_table_t *table, log_seg_id_t head,
 						 log_seg_id_t seg_id, log_index_lsn_t *lsn_info)
@@ -1021,10 +1077,14 @@ log_index_insert_new_seg(log_mem_table_t *table, log_seg_id_t head,
 
 	seg->head_seg = head;
 
+    //XI: if the head's list have no other elements
+    //      set head's next segment to seg_id
 	if (item->tail_seg == head)
 		item->next_seg = seg_id;
 	else
 	{
+        // XI: Find the last segment of this head list
+        //      and set last segment's next_seg as seg_id
 		log_item_seg_t *pre_seg = log_index_item_seg(&table->data, item->tail_seg);
 
 		if (pre_seg == NULL)
@@ -1040,11 +1100,18 @@ log_index_insert_new_seg(log_mem_table_t *table, log_seg_id_t head,
 	seg->prev_seg = item->tail_seg;
 	item->tail_seg = seg_id;
 
+    // XI: now this segment is tail, set its tail as InValid
 	seg->next_seg = LOG_INDEX_TBL_INVALID_SEG;
+    // XI: Why number is 1?
 	seg->number = 1;
+    // XI: set this segment's lsn[0] as lsn_info.lsn(suffix)
 	LOG_INDEX_INSERT_LSN_INFO(seg, 0, lsn_info);
 }
 
+//XI: if the head list only has one head element, append it to head node
+//XI: else, append it to tail segment node
+//XI: Before this function, caller function will check whether this list is full
+//XI: return value idx is the position in suffix LSN list
 static uint8
 log_index_append_lsn(log_mem_table_t *table, log_seg_id_t head, log_index_lsn_t *lsn_info)
 {
@@ -1056,6 +1123,7 @@ log_index_append_lsn(log_mem_table_t *table, log_seg_id_t head, log_index_lsn_t 
 
 	item = log_index_item_head(&table->data, head);
 
+    //XI: if the head list has no segment element, add suffix lsn to the head
 	if (item->tail_seg == head)
 	{
 		Assert(item->number < LOG_INDEX_ITEM_HEAD_LSN_NUM);
@@ -1064,7 +1132,7 @@ log_index_append_lsn(log_mem_table_t *table, log_seg_id_t head, log_index_lsn_t 
 		item->number++;
 	}
 	else
-	{
+	{ //XI: find the tail node and insert suffix LSN
 		seg = log_index_item_seg(&table->data, item->tail_seg);
 		Assert(seg != NULL);
 		Assert(seg->number < LOG_INDEX_ITEM_SEG_LSN_NUM);
@@ -1076,6 +1144,13 @@ log_index_append_lsn(log_mem_table_t *table, log_seg_id_t head, log_index_lsn_t 
 	return idx;
 }
 
+//XI: find the free segment from the active table list
+//XI: return value is the $free_head when inserting into the current ACTIVE_TABLE
+//XI: LOOP all the active_table in the mem_table list
+//      if table is new, use it and insert the first segment
+//      if table is full or old(lsn doesn't match), loop to next mem_table and
+//          set it as inactive talbe, also update global variable(active_table id)
+//      otherwise, adopt the current active table, return (active_table->free_head++)
 static log_seg_id_t
 log_index_next_free_seg(log_index_snapshot_t *logindex_snapshot, XLogRecPtr lsn, log_mem_table_t **active_table)
 {
@@ -1083,8 +1158,10 @@ log_index_next_free_seg(log_index_snapshot_t *logindex_snapshot, XLogRecPtr lsn,
 	log_mem_table_t *active;
 	int next_mem_id = -1;
 
+    //XI: iterate all the table in mem_table list
 	for (;;)
 	{
+        //XI: get current active table using snapshot->active_table(int)
 		active = LOG_INDEX_MEM_TBL_ACTIVE();
 
 		if (LOG_INDEX_MEM_TBL_STATE(active) == LOG_INDEX_MEM_TBL_STATE_ACTIVE)
@@ -1097,18 +1174,23 @@ log_index_next_free_seg(log_index_snapshot_t *logindex_snapshot, XLogRecPtr lsn,
 			 * new lsn prefix is different than this table's lsn prefix
 			 * we will allocate new active memory table.
 			 */
+            //XI: TBL_IS_NEW-> if all the info in active-table is unsetted
 			if (LOG_INDEX_MEM_TBL_IS_NEW(active))
 			{
+                //XI: set table's prefix_lsn with the current parameter lsn
 				LOG_INDEX_MEM_TBL_SET_PREFIX_LSN(active, lsn);
+                //XI: return table's free_head++
 				dst = LOG_INDEX_MEM_TBL_UPDATE_FREE_HEAD(active);
 			}
-			else if (LOG_INDEX_MEM_TBL_FULL(active) ||
-					 !LOG_INDEX_SAME_TABLE_LSN_PREFIX(&active->data, lsn))
+			else if (LOG_INDEX_MEM_TBL_FULL(active) ||    // XI: if free-head reached the maximum
+					 !LOG_INDEX_SAME_TABLE_LSN_PREFIX(&active->data, lsn)) //XI: if this table has different table prefix lsn
 			{
+                // XI: set this table as InActive
 				LOG_INDEX_MEM_TBL_SET_STATE(active, LOG_INDEX_MEM_TBL_STATE_INACTIVE);
+                // XI: Loop to next active table, (ACTIVE_ID+1) % (mem_table_size)
 				next_mem_id = LOG_INDEX_MEM_TBL_NEXT_ID(LOG_INDEX_MEM_TBL_ACTIVE_ID);
 			}
-			else
+			else //XI: table's free head++
 				dst = LOG_INDEX_MEM_TBL_UPDATE_FREE_HEAD(active);
 		}
 
@@ -1117,6 +1199,7 @@ log_index_next_free_seg(log_index_snapshot_t *logindex_snapshot, XLogRecPtr lsn,
 
 		if (next_mem_id != -1)
 		{
+            // XI: change to new active table
 			active = LOG_INDEX_MEM_TBL(next_mem_id);
 			*active_table = active;
 
@@ -1173,20 +1256,27 @@ log_index_get_tbl_bloom(log_index_snapshot_t *logindex_snapshot, log_idx_table_i
 	return (log_file_table_bloom_t *)(shared->page_buffer[slot] + offset);
 }
 
-
+// XI: Initialize bloom_filter in the bloom_bytes
+// XI: and calculate $table's all the head node to this bloom_filter
 static void
 log_index_calc_bloom(log_mem_table_t *table, log_file_table_bloom_t *bloom)
 {
 	bloom_filter *filter;
 	int i;
 
+    // XI: initialize bloom_filter in the bloom_bytes
 	filter = bloom_init_struct(bloom->bloom_bytes, bloom->buf_size,
 							   LOG_INDEX_BLOOM_ELEMS_NUM, 0);
 
+    // XI: iterate all the hash slot in the table
 	for (i = 0; i < LOG_INDEX_MEM_TBL_HASH_NUM; i++)
 	{
+        // XI: $id is the segment id corresponding to this hash slot
+        // XI: if there is no values in this slot, id is 0
 		log_seg_id_t id = LOG_INDEX_TBL_SLOT_VALUE(&table->data, i);
 
+        // XI: if this slot has a valid item
+        // XI: traverse all the head in this slot (hash conflict) and add them to bloom_filter
 		if (id != LOG_INDEX_TBL_INVALID_SEG)
 		{
 			log_item_head_t *item = log_index_item_head(&table->data, id);
@@ -1209,7 +1299,9 @@ static bool
 log_index_save_table(log_index_snapshot_t *logindex_snapshot, log_idx_table_data_t *table, File fd, log_file_table_bloom_t *bloom)
 {
 	int ret = -1;
+    //XI: (tid)-1) / LOG_INDEX_TABLE_NUM_PER_FILE
 	uint64 segno = LOG_INDEX_FILE_TABLE_SEGMENT_NO(table->idx_table_id);
+    //XI: (((tid)-1) % LOG_INDEX_TABLE_NUM_PER_FILE) * sizeof(log_idx_table_data_t)
 	off_t offset = LOG_INDEX_FILE_TABLE_SEGMENT_OFFSET(table->idx_table_id);
 	char        path[MAXPGPATH];
 
@@ -1257,15 +1349,21 @@ log_index_get_bloom_data(log_mem_table_t *table, log_idx_table_id_t tid, log_fil
 	bloom->idx_table_id = tid;
 	bloom->max_lsn = InvalidXLogRecPtr;
 	bloom->min_lsn = UINT64_MAX;
+    //XI: buf_size is the ($bloom_bytes) size
 	bloom->buf_size = LOG_INDEX_FILE_TBL_BLOOM_SIZE -
 					  offsetof(log_file_table_bloom_t, bloom_bytes);
 
+    //XI: calculate all the table's head nodes' data to bloom->bloom_bytes
+    //XI: the bloom->bloom_bytes has a bloom_filter
 	log_index_calc_bloom(table, bloom);
 
 	bloom->crc = 0;
 	bloom->crc = log_index_calc_crc((unsigned char *)bloom, LOG_INDEX_FILE_TBL_BLOOM_SIZE);
 }
 
+// XI: Save bloom to disk file
+// XI: Get the slur page corresponding to this table's bloom data
+// XI: Write bloom data using slru
 static void
 log_index_save_bloom(log_index_snapshot_t *logindex_snapshot, log_idx_table_id_t tid, log_file_table_bloom_t *bloom)
 {
@@ -1286,6 +1384,8 @@ log_index_save_bloom(log_index_snapshot_t *logindex_snapshot, log_idx_table_id_t
 	LWLockRelease(LOG_INDEX_BLOOM_LRU_LOCK);
 }
 
+// XI: Calculate file name by table_id, then open it and return fd
+// XI: logindex_snapshot is useless??
 static int
 log_index_open_table_file(log_index_snapshot_t *logindex_snapshot, log_idx_table_id_t tid, bool readonly, int elevel)
 {
@@ -1295,6 +1395,7 @@ log_index_open_table_file(log_index_snapshot_t *logindex_snapshot, log_idx_table
 	uint64 segno = LOG_INDEX_FILE_TABLE_SEGMENT_NO(tid);
 	off_t offset = LOG_INDEX_FILE_TABLE_SEGMENT_OFFSET(tid);
 
+    // XI: parse table name to $path
 	LOG_INDEX_FILE_TABLE_NAME(path, segno);
 
 	if (readonly)
@@ -1322,6 +1423,7 @@ log_index_open_table_file(log_index_snapshot_t *logindex_snapshot, log_idx_table
 	return fd;
 }
 
+// XI: Open table from file, read table data to parameter $table
 bool
 log_index_read_table_data(log_index_snapshot_t *logindex_snapshot, log_idx_table_data_t *table, log_idx_table_id_t tid, int elevel)
 {
@@ -1371,6 +1473,9 @@ log_index_read_table_data(log_index_snapshot_t *logindex_snapshot, log_idx_table
 	return true;
 }
 
+// XI: 1. Calculate bloom data of this table
+// XI: 2. Save bloom data to disk using slru
+// XI: 3. Save and sync table data to disk
 static bool
 log_index_write_table_data(log_index_snapshot_t *logindex_snapshot, log_mem_table_t *table)
 {
@@ -1386,13 +1491,17 @@ log_index_write_table_data(log_index_snapshot_t *logindex_snapshot, log_mem_tabl
 
 	bloom = (log_file_table_bloom_t *)palloc0(LOG_INDEX_FILE_TBL_BLOOM_SIZE);
 
+    //XI: calculate the bloom value of this table. (I think $table and $tid is duplicated, can ignore $tid)
+    //XI: $bloom is a bloom_filter header, the bloom_filter is stored in $bloom->bloom_bytes
 	log_index_get_bloom_data(table, tid, bloom);
 
 	/*
 	 * POLAR: we save bloom data before table data, in case that replica
 	 * read bloom data with zero page
 	 */
+    //XI: Save this table's bloom data by slru
 	log_index_save_bloom(logindex_snapshot, tid, bloom);
+    //XI: Write and Sync this table's data to disk file
 	ret = log_index_save_table(logindex_snapshot, &table->data, fd, bloom);
 	pfree(bloom);
 
@@ -1480,6 +1589,7 @@ log_index_read_seg_file(log_index_snapshot_t *logindex_snapshot, log_table_cache
 	cache->min_idx_table_id = LOG_INDEX_TABLE_INVALID_ID;
 	cache->max_idx_table_id = LOG_INDEX_TABLE_INVALID_ID;
 
+    //XI: if max_idx_table_id > segno(file_num)* table/file
 	delta_table = (meta.max_idx_table_id >= (segno * LOG_INDEX_TABLE_NUM_PER_FILE)) ?
 				  meta.max_idx_table_id - (segno * LOG_INDEX_TABLE_NUM_PER_FILE) : 0;
 
@@ -1582,6 +1692,7 @@ log_index_read_seg_file(log_index_snapshot_t *logindex_snapshot, log_table_cache
 log_idx_table_data_t *
 log_index_read_table(logindex_snapshot_t logindex_snapshot, log_idx_table_id_t tid, log_mem_table_t **mem_table)
 {
+    //XI: here table_cache is a static variable
 	static log_table_cache_t table_cache;
 	int mid = (tid - 1) % logindex_snapshot->mem_tbl_size;
 	log_mem_table_t *table = LOG_INDEX_MEM_TBL(mid);
@@ -1602,9 +1713,11 @@ log_index_read_table(logindex_snapshot_t logindex_snapshot, log_idx_table_id_t t
 		LWLockRelease(table_lock);
 	}
 
+    //XI: try to find it in the cache
 	if ((strcmp(table_cache.name, logindex_snapshot->dir) != 0) ||
 			tid < table_cache.min_idx_table_id || tid > table_cache.max_idx_table_id)
 	{
+        //XI: if it's not in the cache, read it from file to the cache
 		if (!log_index_read_seg_file(logindex_snapshot, &table_cache, LOG_INDEX_FILE_TABLE_SEGMENT_NO(tid)))
 		{
 			log_index_report_io_error(logindex_snapshot, tid);
@@ -1632,6 +1745,9 @@ log_index_read_table(logindex_snapshot_t logindex_snapshot, log_idx_table_id_t t
 	return data;
 }
 
+//XI: write $table data and bloom data to disk
+//XI: if there are previous table hasn't been written, just return
+//XI: if this table is not an active table, also update the meta data in the disk
 bool
 log_index_write_table(log_index_snapshot_t *logindex_snapshot, log_mem_table_t *table)
 {
@@ -1649,8 +1765,10 @@ log_index_write_table(log_index_snapshot_t *logindex_snapshot, log_mem_table_t *
 	/*
 	 * Save logindex table base on the table id order
 	 */
+    //XI: writing table should one by one, if there are other previous tables haven't been written, return.
 	if (tid == meta->max_idx_table_id + 1)
 	{
+        //XI: here really write table data and bloom data to disk
 		if (!log_index_write_table_data(logindex_snapshot, table))
 			log_index_report_io_error(logindex_snapshot, LOG_INDEX_MEM_TBL_TID(table));
 		/* We don't update meta when flush active memtable */
@@ -1666,10 +1784,13 @@ log_index_write_table(log_index_snapshot_t *logindex_snapshot, log_mem_table_t *
 			meta->max_lsn = Max(meta->max_lsn, table->data.max_lsn);
 			SpinLockRelease(LOG_INDEX_SNAPSHOT_LOCK);
 
+            //XI: this table will fall in segment_no file
 			segment_no = LOG_INDEX_FILE_TABLE_SEGMENT_NO(tid);
 
 			min_seg->segment_no = Min(min_seg->segment_no, segment_no);
 
+            //XI: meta data saved the minimal file segment no.
+            //XI: if this table is also included in this file, update the meta data
 			if (min_seg->segment_no == segment_no)
 			{
 				min_seg->max_lsn = Max(table->data.max_lsn, min_seg->max_lsn);
@@ -1816,6 +1937,7 @@ log_index_truncate(log_index_snapshot_t *logindex_snapshot, XLogRecPtr lsn)
 	return true;
 }
 
+//XI: keep truncating the files until the last created file
 void
 polar_logindex_truncate(log_index_snapshot_t *logindex_snapshot, XLogRecPtr lsn)
 {
@@ -1832,6 +1954,7 @@ polar_logindex_truncate(log_index_snapshot_t *logindex_snapshot, XLogRecPtr lsn)
 	}
 }
 
+//XI: This function only return true when the last table's last LSN equal to parameter $lsn_info.lsn and page_tag matches
 static bool
 log_index_exists_in_saved_table(log_index_snapshot_t *logindex_snapshot, log_index_lsn_t *lsn_info)
 {
@@ -1841,6 +1964,7 @@ log_index_exists_in_saved_table(log_index_snapshot_t *logindex_snapshot, log_ind
 	BufferTag      tag;
 	log_index_lsn_t saved_lsn;
 
+    //XI: Change to the previous active table in the mem_table list
 	SpinLockAcquire(LOG_INDEX_SNAPSHOT_LOCK);
 	mid = LOG_INDEX_MEM_TBL_PREV_ID(LOG_INDEX_MEM_TBL_ACTIVE_ID);
 	SpinLockRelease(LOG_INDEX_SNAPSHOT_LOCK);
@@ -1856,9 +1980,11 @@ log_index_exists_in_saved_table(log_index_snapshot_t *logindex_snapshot, log_ind
 
 	for (i = table->data.last_order; i > 0; i--)
 	{
+        //XI: if the table's order[i-1]'s LSN is not what we expected, return false
 		if (log_index_get_order_lsn(&table->data, i - 1, &saved_lsn) != lsn_info->lsn)
 			return false;
 
+        //XI: if the LSN is we expected and the tags matches
 		if (BUFFERTAGS_EQUAL(*(lsn_info->tag), *(saved_lsn.tag)))
 			return true;
 	}
@@ -1866,6 +1992,11 @@ log_index_exists_in_saved_table(log_index_snapshot_t *logindex_snapshot, log_ind
 	return false;
 }
 
+//XI: find a free space to insert a LSN
+//XI: if the current table is full, loop to another table in mem_table list, change active table
+//XI: if the active-table doesn't have this page before, insert a new head node
+//XI:   else (current table has this page and record is not full in the tail node), append lsn to tail node
+//XI: Also, update table and snapshot's max-min LSN info.
 void
 log_index_insert_lsn(log_index_snapshot_t *logindex_snapshot, log_index_lsn_t *lsn_info,  uint32 key)
 {
@@ -1881,20 +2012,25 @@ log_index_insert_lsn(log_index_snapshot_t *logindex_snapshot, log_index_lsn_t *l
 	 * 1. Logindex table state is atomic uint32, it's safe to change state without table lock
 	 * 2. Only one process insert lsn, so it's safe to check exists page without hash lock
 	 */
+    //XI: if the page doesn't exist in active table, head==NULL.
 	if (LOG_INDEX_MEM_TBL_STATE(active) == LOG_INDEX_MEM_TBL_STATE_ACTIVE &&
 			LOG_INDEX_SAME_TABLE_LSN_PREFIX(&active->data, lsn_info->lsn))
 		head = log_index_mem_tbl_exists_page(lsn_info->tag, &active->data, key);
 
 	new_item = (head == LOG_INDEX_TBL_INVALID_SEG);
 
+    // XI: if the page exists in the list and list isn't full
 	if (!new_item && !log_index_mem_seg_full(active, head))
 	{
 		uint8 idx;
 		log_item_head_t *item;
 
+        //XI: append a lsn record to an already exists node (which is not full)
 		LWLockAcquire(LOG_INDEX_HASH_LOCK(key), LW_EXCLUSIVE);
 		idx = log_index_append_lsn(active, head, lsn_info);
 		item = log_index_item_head(&active->data, head);
+        //XI: update idx_mem_table's order list
+        //XI: append "segID&0FFF | (idx<<12)&F000" to the order list
 		LOG_INDEX_MEM_TBL_ADD_ORDER(&active->data, item->tail_seg, idx);
 		LWLockRelease(LOG_INDEX_HASH_LOCK(key));
 	}
@@ -1903,15 +2039,21 @@ log_index_insert_lsn(log_index_snapshot_t *logindex_snapshot, log_index_lsn_t *l
 		log_seg_id_t    dst;
 		log_mem_table_t *old_active = active;
 
+        //XI: dst is the free_head value in the current active_table
+        //XI: in this function, the active table may change, which means old_active!=active
 		dst = log_index_next_free_seg(logindex_snapshot, lsn_info->lsn, &active);
 
 		Assert(dst != LOG_INDEX_TBL_INVALID_SEG);
 
 		LWLockAcquire(LOG_INDEX_HASH_LOCK(key), LW_EXCLUSIVE);
 
+        //XI: if the page doesn't exist in the current active table
+        //      or page exists in this current active table, however this table($old_active) is full
+        //      or both dost exists in this table and table($old_active) is full
+        //    then insert a new head in the current active-table
 		if (new_item || active != old_active)
 			log_index_insert_new_item(lsn_info, active, key, dst);
-		else
+		else //XI: find free space in old_active table, occupy table.seg[dst] as new segment node
 			log_index_insert_new_seg(active, head, dst, lsn_info);
 
 		LOG_INDEX_MEM_TBL_ADD_ORDER(&active->data, dst, 0);
@@ -1941,6 +2083,7 @@ polar_logindex_add_lsn(log_index_snapshot_t *logindex_snapshot, BufferTag *tag, 
 	lsn_info.lsn = lsn;
 	lsn_info.prev_lsn = prev;
 
+    //XI: if the state is not ADDING, maybe INITIALIZED??
 	if (unlikely(!polar_logindex_check_state(logindex_snapshot, POLAR_LOGINDEX_STATE_ADDING)))
 	{
 		/* Insert logindex from meta->start_lsn, so We don't save logindex which lsn is less then meta->start_lsn */
@@ -1959,6 +2102,8 @@ polar_logindex_add_lsn(log_index_snapshot_t *logindex_snapshot, BufferTag *tag, 
 		 * If lsn is equal to max saved lsn then
 		 * we check whether the tag is in saved table
 		 */
+        //XI: this function check whether previous table (active_id-1)'s the last record
+        //      if what we want (LSN matches and page_tag matches).
 		if (meta->max_lsn == lsn
 				&& log_index_exists_in_saved_table(logindex_snapshot, &lsn_info))
 			return;
@@ -1971,6 +2116,8 @@ polar_logindex_add_lsn(log_index_snapshot_t *logindex_snapshot, BufferTag *tag, 
 		elog(LOG, "%s log index is insert from %lx", logindex_snapshot->dir, lsn);
 	}
 
+    //XI: Insert a new segment to active table (or append lsn to not full node),
+    //      this process may include changing active table.
 	log_index_insert_lsn(logindex_snapshot, &lsn_info, key);
 
 	if (unlikely(polar_trace_logindex_messages <= DEBUG4))
@@ -1992,6 +2139,9 @@ polar_logindex_add_lsn(log_index_snapshot_t *logindex_snapshot, BufferTag *tag, 
 	}
 }
 
+//XI: Find a page in $table.
+//  If found, return its head node
+//  Otherwise, return NULL
 log_item_head_t *
 log_index_tbl_find(BufferTag *tag,
 				   log_idx_table_data_t *table, uint32 key)
@@ -2004,6 +2154,7 @@ log_index_tbl_find(BufferTag *tag,
 	return log_index_item_head(table, item_id);
 }
 
+//XI: return the logindex_snapshot->max_lsn with lock involved
 XLogRecPtr
 polar_get_logindex_snapshot_max_lsn(log_index_snapshot_t *logindex_snapshot)
 {
@@ -2018,6 +2169,9 @@ polar_get_logindex_snapshot_max_lsn(log_index_snapshot_t *logindex_snapshot)
 /*
  * POLAR: load flushed/active tables from storages
  */
+//XI: load at most mem_tbl_size table from disk to snapshot
+//XI: Start a new active table
+//TODO
 void
 polar_load_logindex_snapshot_from_storage(log_index_snapshot_t *logindex_snapshot, XLogRecPtr start_lsn)
 {
@@ -2041,6 +2195,7 @@ polar_load_logindex_snapshot_from_storage(log_index_snapshot_t *logindex_snapsho
 
 	LWLockAcquire(LOG_INDEX_IO_LOCK, LW_EXCLUSIVE);
 
+    //XI: read the meta data file from the disk
 	if (log_index_get_meta(logindex_snapshot, meta))
 		new_max_idx_table_id = meta->max_idx_table_id;
 
@@ -2055,11 +2210,13 @@ polar_load_logindex_snapshot_from_storage(log_index_snapshot_t *logindex_snapsho
 	 * we cannot load all tables, because memtable is limited, so we should
 	 * calculate min table to load
 	 */
+    //XI: if it's initializing, load the latest snapshot->mem_tbl_size tables
 	if (!(state & POLAR_LOGINDEX_STATE_INITIALIZED))
 	{
 		Assert(!XLogRecPtrIsInvalid(start_lsn));
 
 		/* we load at most mem_tbl_size tables */
+        //XI: Load mem_tbl_size or fewer tables from storage
 		if (new_max_idx_table_id > logindex_snapshot->mem_tbl_size)
 			min_tid = Max(new_max_idx_table_id - logindex_snapshot->mem_tbl_size + 1,
 						  meta->min_segment_info.min_idx_table_id);
@@ -2070,13 +2227,15 @@ polar_load_logindex_snapshot_from_storage(log_index_snapshot_t *logindex_snapsho
 		if (min_tid == LOG_INDEX_TABLE_INVALID_ID)
 			min_tid = new_max_idx_table_id;
 	}
-	else
+	else // XI: if the state is INITIALIZED, log from snapshot->max_tid to snapshot->max_tid + mem_tbl_size
 	{
 		/*
 		 * When db start, there is no table to load, so active table_id is
 		 * still invalid, at this situation, we should assign tid to active
 		 * table(tid = 1)
 		 */
+        //XI: at db start, this table_id is invalid (just initialized), initialize this table as ACTIVE
+        //      and tid as snapshot->max_tid
 		if (LOG_INDEX_MEM_TBL_TID(active) == LOG_INDEX_TABLE_INVALID_ID)
 			log_index_wait_active(logindex_snapshot, active, InvalidXLogRecPtr);
 
@@ -2088,6 +2247,8 @@ polar_load_logindex_snapshot_from_storage(log_index_snapshot_t *logindex_snapsho
 
 	Assert(min_tid != LOG_INDEX_TABLE_INVALID_ID);
 
+    //XI: load table from min_tid to new_max_idx_table_id, clear the old bloom data
+    //XI: append a new active table after new_max_idx_table_id
 	/* If we have more flushed tables to loaded */
 	if (new_max_idx_table_id >= min_tid)
 	{
@@ -2096,6 +2257,7 @@ polar_load_logindex_snapshot_from_storage(log_index_snapshot_t *logindex_snapsho
 
 		while (tid >= min_tid)
 		{
+            //XI: transfer tid to mem_tbl_id
 			mid = (tid - 1) % logindex_snapshot->mem_tbl_size;
 			mem_tbl = LOG_INDEX_MEM_TBL(mid);
 
@@ -2181,6 +2343,7 @@ polar_logindex_mem_tbl_size(logindex_snapshot_t logindex_snapshot)
 	return logindex_snapshot != NULL ? logindex_snapshot->mem_tbl_size : 0;
 }
 
+//XI: snapshot->max_tid - meta->max_tid
 uint64
 polar_logindex_used_mem_tbl_size(logindex_snapshot_t logindex_snapshot)
 {
@@ -2211,6 +2374,8 @@ polar_get_logindex_snapshot_dir(logindex_snapshot_t logindex_snapshot)
 	return logindex_snapshot->dir;
 }
 
+//XI: read disk's minimal lsn
+//XI: use meta->min_seg to get the oldest table in the disk, then return $table->min_lsn
 XLogRecPtr
 polar_get_logindex_snapshot_storage_min_lsn(logindex_snapshot_t logindex_snapshot)
 {
@@ -2242,6 +2407,10 @@ polar_get_logindex_snapshot_storage_min_lsn(logindex_snapshot_t logindex_snapsho
 	return min_lsn;
 }
 
+//XI: Set SlruShared->polar_ro_promoting = true
+//XI: Set snapshot->state WRITABLE
+//XI: Updating states from Inactive to Flushed, iterating from meta->max_saved_tid to mem_tbl->max_tid
+//TODO
 void
 polar_logindex_online_promote(logindex_snapshot_t logindex_snapshot)
 {
@@ -2274,6 +2443,8 @@ polar_logindex_online_promote(logindex_snapshot_t logindex_snapshot)
 	POLAR_LOG_LOGINDEX_META_INFO(meta);
 }
 
+//XI: if snapshot->meta.start_lsn is valid, return it
+//XI: otherwise, if reach consistency in replica node, read meta from disk
 XLogRecPtr
 polar_logindex_check_valid_start_lsn(logindex_snapshot_t logindex_snapshot)
 {
@@ -2303,6 +2474,7 @@ polar_logindex_check_valid_start_lsn(logindex_snapshot_t logindex_snapshot)
 	return start_lsn;
 }
 
+//XI: set snapshot->meta.start_lsn and update disk meta
 void
 polar_logindex_set_start_lsn(logindex_snapshot_t logindex_snapshot, XLogRecPtr start_lsn)
 {
@@ -2322,6 +2494,7 @@ polar_logindex_mem_table_max_lsn(struct log_mem_table_t *table)
 	return table->data.max_lsn;
 }
 
+//XI: create cache to snapshot->segment_cache and move the old local cache to trash dir
 void
 polar_logindex_create_local_cache(logindex_snapshot_t logindex_snapshot, const char *cache_name, uint32 max_segments)
 {
@@ -2352,6 +2525,7 @@ polar_trace_logindex(int trace_level)
 	return trace_level;
 }
 
+//XI: update promoted_info's last inserted lsn
 void
 polar_logindex_update_promoted_info(logindex_snapshot_t logindex_snapshot, XLogRecPtr last_replayed_lsn)
 {

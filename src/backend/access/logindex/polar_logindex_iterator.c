@@ -139,9 +139,14 @@ log_index_stack_release(log_index_page_stack_lsn_t *stack)
 	}
 }
 
+//XI: get the segment's page tag
+//XI: first, get the page node by seg_id
+//XI: then, pagetag is stored in head->tag
 static BufferTag *
 log_index_get_seg_page_tag(log_idx_table_data_t *table, log_seg_id_t seg_id)
 {
+    //XI: here maybe the seg_id is a head node, not seg node
+    //XI: however, these two struct first element are both head_seg_id, so doesn't matter
 	log_item_seg_t  *seg = log_index_item_seg(table, seg_id);
 	log_seg_id_t    head_seg;
 	log_item_head_t *head;
@@ -154,6 +159,12 @@ log_index_get_seg_page_tag(log_idx_table_data_t *table, log_seg_id_t seg_id)
 	return &head->tag;
 }
 
+//XI: this function get the previous lsn
+//XI: Caller tell you the record is $table's No.($seg_id segment's) No.($idx) LSN record
+//XI: If this record is stored in head node's first LSN slot, then prev_lsn is head->prev_page_lsn
+//XI:   else, it's stored in head->suffix_lsn[idx-1]
+//XI: If this record is stored in segment nodes' first LSN slot, then prev_lsn is its prev_seg last record
+//XI:   else, it's stored in seg->suffix_lsn[idx-1]
 static XLogRecPtr
 log_index_get_seg_prev_lsn(log_idx_table_data_t *table,
 						   log_seg_id_t seg_id, uint8 idx)
@@ -166,6 +177,7 @@ log_index_get_seg_prev_lsn(log_idx_table_data_t *table,
 	Assert(seg != NULL);
 	head_seg = seg->head_seg;
 
+    //XI: if target node is a head node
 	if (head_seg == seg_id)
 	{
 		head = log_index_item_head(table, seg_id);
@@ -176,9 +188,11 @@ log_index_get_seg_prev_lsn(log_idx_table_data_t *table,
 			return LOG_INDEX_COMBINE_LSN(table, head->suffix_lsn[idx - 1]);
 	}
 
+    //XI: Case: segment nodes idx>0 record, then it's stored in idx-1 slot
 	if (idx > 0)
 		return LOG_INDEX_COMBINE_LSN(table, seg->suffix_lsn[idx - 1]);
 
+    //XI: Case: segment node idx==0 record, then it's stored in the prev_node's last slot
 	prev_seg = seg->prev_seg;
 
 	if (prev_seg == seg->head_seg)
@@ -756,6 +770,8 @@ log_index_set_search_table(log_index_lsn_iter_t iter, log_idx_table_data_t *tabl
 	iter->last_search_tid = tid;
 }
 
+//XI: return the No.($order) record's LSN from the table.Order[]
+//XI: return value is LSN. Also set $LSN, $Prev_LSN, $Page_tag of parameter $lsn_info
 XLogRecPtr
 log_index_get_order_lsn(log_idx_table_data_t *table, uint32 order, log_index_lsn_t *lsn_info)
 {
@@ -778,22 +794,26 @@ log_index_get_order_lsn(log_idx_table_data_t *table, uint32 order, log_index_lsn
 	/*
 	 * The valid order value start from 1 and the array index start from 0
 	 */
+    //XI: This is the position of active->segment[] list
 	seg_id = LOG_INDEX_SEG_ORDER(table->idx_order[order]);
+    //XI: This is the position of segment->suffixlsn[] list (one segment may contain many LSN??)
 	idx = LOG_INDEX_ID_ORDER(table->idx_order[order]);
 	seg = log_index_item_seg(table, seg_id);
 
 	Assert(seg != NULL);
 
+    //XI: If the target node is a head node
 	if (seg->head_seg == seg_id)
 	{
 		head = log_index_item_head(table, seg_id);
 		Assert(idx < head->number);
 		lsn = LOG_INDEX_COMBINE_LSN(table, head->suffix_lsn[idx]);
 
+        //XI: copy the node segment info to parameter, the caller will compare the lsn_info with its own value
 		if (lsn_info != NULL)
 			LOG_INDEX_COPY_LSN_INFO(lsn_info, table, head, idx);
 	}
-	else
+	else //XI: If the target node is a segment node
 	{
 		Assert(idx < seg->number);
 		lsn = LOG_INDEX_COMBINE_LSN(table, seg->suffix_lsn[idx]);
