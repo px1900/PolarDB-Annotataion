@@ -51,6 +51,7 @@ static proc_occupied_mini_trans_t proc_occupied_mini_trans = {0};
 #define MINI_TRANSACTION_LOCK(trans)                   (&(trans)->lock[0].lock)
 #define MINI_TRANSACTION_TABLE_LOCK(trans, k)      (&(trans)->lock[1+(k)].lock)
 
+//XI: Init mini_trans struct and Init mini_trans lock & mini_trans table lock
 static void
 mini_trans_init(mini_trans_t trans)
 {
@@ -76,6 +77,7 @@ polar_logindex_mini_trans_shmem_size(void)
 	return CACHELINEALIGN(sizeof(mini_trans_data_t));
 }
 
+//XI: Postmaster init a new mini_trans, otherwise, find it existed in the shared memory
 mini_trans_t
 polar_logindex_mini_trans_shmem_init(const char *name)
 {
@@ -97,6 +99,9 @@ polar_logindex_mini_trans_shmem_init(const char *name)
 	return mini_trans;
 }
 
+//XI: when aborting a transaction, the current process is hold many mini_trans locks
+//XI: process iterating all the acquired_locks and unlock them.
+//XI: After that, set proc_occupied_mini_trans.trans = NULL
 void
 polar_logindex_abort_mini_transaction(mini_trans_t trans)
 {
@@ -116,6 +121,8 @@ polar_logindex_abort_mini_transaction(mini_trans_t trans)
 	proc_occupied_mini_trans.trans = NULL;
 }
 
+//XI: This function is with lock trans.lock[0]
+//XI Initialize $trans->started and $trans->lsn
 int
 polar_logindex_mini_trans_start(mini_trans_t trans, XLogRecPtr lsn)
 {
@@ -134,6 +141,7 @@ polar_logindex_mini_trans_start(mini_trans_t trans, XLogRecPtr lsn)
 	return 0;
 }
 
+//XI: Set $info with buffer tag
 static inline void
 mini_trans_set_info(mini_trans_info_t *info, BufferTag *tag)
 {
@@ -142,6 +150,8 @@ mini_trans_set_info(mini_trans_info_t *info, BufferTag *tag)
 	info->next = 0;
 }
 
+//XI: trans->info[] is a hash map, occupied is an occupied status bit-map corresponding with trans->info[]
+//XI: this function first check whether there is a hash-conflict with key, if conflicts, find the first empty slot and occupy it
 static polar_page_lock_t
 mini_trans_insert_tag(mini_trans_t trans, BufferTag *tag, uint32 key)
 {
@@ -193,6 +203,7 @@ mini_trans_insert_tag(mini_trans_t trans, BufferTag *tag, uint32 key)
 
 }
 
+//XI: Search hashmap with hash conflict situation
 static polar_page_lock_t
 mini_trans_find(mini_trans_t trans, BufferTag *tag, uint32 key)
 {
@@ -220,6 +231,8 @@ mini_trans_find(mini_trans_t trans, BufferTag *tag, uint32 key)
 	return POLAR_INVALID_PAGE_LOCK;
 }
 
+//XI: find expected mini_trans_info and increase ref by one
+//XI: Return the lock id
 static polar_page_lock_t
 mini_trans_increase_ref(mini_trans_t trans, BufferTag *tag, uint32 key)
 {
@@ -238,6 +251,9 @@ mini_trans_increase_ref(mini_trans_t trans, BufferTag *tag, uint32 key)
 	return i;
 }
 
+//XI: Increase $trans.ref by one
+//XI: Lock $trans target table with $mode
+//XI: Also set proc_acquired_mini_trans.acquired_lock[$lock_id]=true
 polar_page_lock_t
 polar_logindex_mini_trans_cond_key_lock(mini_trans_t trans, BufferTag *tag, uint32 key,
 										LWLockMode mode, XLogRecPtr *lsn)
@@ -247,36 +263,46 @@ polar_logindex_mini_trans_cond_key_lock(mini_trans_t trans, BufferTag *tag, uint
 
 	LWLockAcquire(MINI_TRANSACTION_LOCK(trans), LW_SHARED);
 
+    //XI: First lock the whole mini_trans
 	if (trans->started == true && trans->lsn != InvalidXLogRecPtr)
 	{
+        //XI: Increase ref by one
 		l = mini_trans_increase_ref(trans, tag, key);
 
 		if (l != POLAR_INVALID_PAGE_LOCK)
 		{
+            //XI: get target table lock
 			lock = MINI_TRANSACTION_TABLE_LOCK(trans, l - 1);
 
+            //XI: Assign parameter $lsn with trans->lsn
 			if (lsn != NULL)
 				*lsn = trans->lsn;
 		}
 	}
 
+    //XI: Unlock whole mini_trans
 	LWLockRelease(MINI_TRANSACTION_LOCK(trans));
 
 	if (lock)
 	{
+        //XI: Lock this mini_trans table with $mode
 		LWLockAcquire(lock, mode);
 
+        //XI: If necessary, initialize proc_occupied_mini_trans.trans
 		if (proc_occupied_mini_trans.trans == NULL)
 			proc_occupied_mini_trans.trans = trans;
 
+        //XI: There will only have one transaction at the same time inside one process
 		Assert(proc_occupied_mini_trans.trans == trans);
 
+        //XI: Set LOCAL status list acquired_lock[]
 		proc_occupied_mini_trans.acquired_lock[l - 1] = true;
 	}
 
 	return l;
 }
 
+//XI: Wrapper of previous function
 polar_page_lock_t
 polar_logindex_mini_trans_cond_lock(mini_trans_t trans, BufferTag *tag,
 									LWLockMode mode, XLogRecPtr *lsn)
@@ -285,6 +311,8 @@ polar_logindex_mini_trans_cond_lock(mini_trans_t trans, BufferTag *tag,
 	return polar_logindex_mini_trans_cond_key_lock(trans, tag, key, mode, lsn);
 }
 
+//XI: If this buffer tag has already been inserted, return this trans->lsn
+//XI: otherwise, return 0(InvalidXLogRecPtr)
 XLogRecPtr
 polar_logindex_mini_trans_key_find(mini_trans_t trans, BufferTag *tag, uint32 key)
 {
@@ -294,6 +322,7 @@ polar_logindex_mini_trans_key_find(mini_trans_t trans, BufferTag *tag, uint32 ke
 
 	if (trans->started == true && trans->lsn != InvalidXLogRecPtr)
 	{
+        //XI: if this lock has been inserted, return value would >0
 		if (mini_trans_find(trans, tag, key) != POLAR_INVALID_PAGE_LOCK)
 			lsn = trans->lsn;
 	}
@@ -303,6 +332,7 @@ polar_logindex_mini_trans_key_find(mini_trans_t trans, BufferTag *tag, uint32 ke
 	return lsn;
 }
 
+//XI: Wrapper of previous function
 XLogRecPtr
 polar_logindex_mini_trans_find(mini_trans_t trans, BufferTag *tag)
 {
@@ -311,6 +341,8 @@ polar_logindex_mini_trans_find(mini_trans_t trans, BufferTag *tag)
 	return polar_logindex_mini_trans_key_find(trans, tag, key);
 }
 
+//XI: The difference with polar_logindex_mini_trans_cond_key_lock is this function
+//      will insert a table lock if it's not exist
 polar_page_lock_t
 polar_logindex_mini_trans_key_lock(mini_trans_t trans, BufferTag *tag, uint32 key,
 								   LWLockMode mode, XLogRecPtr *lsn)
@@ -318,9 +350,12 @@ polar_logindex_mini_trans_key_lock(mini_trans_t trans, BufferTag *tag, uint32 ke
 	polar_page_lock_t l;
 	LWLock *lock = NULL;
 
+    //XI: First acquire the mini_trans lock
 	LWLockAcquire(MINI_TRANSACTION_LOCK(trans), LW_EXCLUSIVE);
 	l = mini_trans_increase_ref(trans, tag, key);
 
+    //XI: If the target table has already been inserted, find the lock
+    //XI: Otherwise, insert it
 	if (l != POLAR_INVALID_PAGE_LOCK)
 	{
 		lock = MINI_TRANSACTION_TABLE_LOCK(trans, l - 1);
@@ -370,6 +405,9 @@ polar_logindex_mini_trans_lock(mini_trans_t trans, BufferTag *tag, LWLockMode mo
 	return l;
 }
 
+//XI: Release trans->lock[1+(l-1)].lock
+//XI: Set trans->info.refcount-- (with trans->lock[0])
+//XI: Set proc_occupied_mini_trans.acquired_lock[i] = false
 void
 polar_logindex_mini_trans_unlock(mini_trans_t trans, polar_page_lock_t l)
 {
@@ -384,9 +422,12 @@ polar_logindex_mini_trans_unlock(mini_trans_t trans, polar_page_lock_t l)
 	if (trans != proc_occupied_mini_trans.trans || !proc_occupied_mini_trans.acquired_lock[i])
 		elog(PANIC, "Unlock mini transaction lock %d, but it's not acquired", l);
 
+    //XI: LockRelease (trans)->lock[1+(l-1)].lock
+    //XI: LockAcquire (trans)->lock[0].lock LW_SHARED
 	LWLockRelease(MINI_TRANSACTION_TABLE_LOCK(trans, i));
 	LWLockAcquire(MINI_TRANSACTION_LOCK(trans), LW_SHARED);
 
+    //XI: Check whether trans.occupied bit is occupied
 	if (!MINI_TRANS_IS_OCCUPIED(trans, l)
 			|| pg_atomic_read_u32(&info[i].refcount) == 0)
 	{
@@ -395,12 +436,16 @@ polar_logindex_mini_trans_unlock(mini_trans_t trans, polar_page_lock_t l)
 							   MINI_TRANS_IS_OCCUPIED(trans, l))));
 	}
 
+    //XI: info[lock-1].refcount --
 	pg_atomic_sub_fetch_u32(&info[i].refcount, 1);
 	LWLockRelease(MINI_TRANSACTION_LOCK(trans));
 
+    //XI: Set proc_occupied_mini_trans.acquired_lock[i] = false
 	proc_occupied_mini_trans.acquired_lock[i] = false;
 }
 
+//XI: Wait all table refcount to zero
+//XI: Clear trans->occupied and trans->info[]
 int
 polar_logindex_mini_trans_end(mini_trans_t trans, XLogRecPtr lsn)
 {
@@ -421,6 +466,8 @@ polar_logindex_mini_trans_end(mini_trans_t trans, XLogRecPtr lsn)
 
 	LWLockRelease(MINI_TRANSACTION_LOCK(trans));
 
+    //XI: it will infinitely check whether all lock.refcount is zero.
+    //XI: Only exist this do{}while loop when all refcount is zero
 	do
 	{
 		unlock_all = true;
@@ -428,6 +475,8 @@ polar_logindex_mini_trans_end(mini_trans_t trans, XLogRecPtr lsn)
 		LWLockAcquire(MINI_TRANSACTION_LOCK(trans), LW_SHARED);
 		occupied = trans->occupied;
 
+        //XI: Here only traverse all the bit in the trans->occupied, however it won't
+        //      change the original $trans->occupied
 		while (occupied)
 		{
 			/* Get position of the lowest bit */
@@ -461,6 +510,9 @@ polar_logindex_mini_trans_end(mini_trans_t trans, XLogRecPtr lsn)
 	return 0;
 }
 
+//XI: The lock should be occupied before, otherwise panic
+//XI: Set trans->info[l-1].added = true
+//XI: What is the difference before info[l-1].added and occupied??? TODO
 void
 polar_logindex_mini_trans_set_page_added(mini_trans_t trans, polar_page_lock_t lock)
 {
@@ -477,6 +529,7 @@ polar_logindex_mini_trans_set_page_added(mini_trans_t trans, polar_page_lock_t l
 	trans->info[i].added = true;
 }
 
+//XI: Get the trans->info[l-1].added value
 bool
 polar_logindex_mini_trans_get_page_added(mini_trans_t trans, polar_page_lock_t lock)
 {

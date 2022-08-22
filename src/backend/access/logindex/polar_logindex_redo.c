@@ -105,6 +105,7 @@ static XLogRecPtr polar_logindex_apply_page_from(polar_logindex_redo_ctl_t insta
 static bool polar_evict_buffer(Buffer buffer);
 static void polar_extend_block_if_not_exist(BufferTag* tag);
 
+//XI: Print Log info for XlogRecord
 static void
 polar_xlog_log(int level, XLogReaderState *record, const char *func)
 {
@@ -135,6 +136,8 @@ polar_xlog_log(int level, XLogReaderState *record, const char *func)
  * If transaction is aborted, the buffer replaying is stopped,
  * so we have to clear its POLAR_REDO_REPLAYING flag.
  */
+//XI: when aborting a transaction, if the $polar_replaying_buff(BuffDesc) is not null
+//XI: Clear this variable, and clear its "POLAR_REDO_REPLAYING" flag
 static void
 polar_logindex_abort_replaying_buffer(void)
 {
@@ -154,6 +157,7 @@ polar_logindex_abort_replaying_buffer(void)
  * For the block file in tag, extend it to tag->blockNum blocks.
  * TODO: blocks are extended one by one, which can be optimized in the future. 
  */
+//XI: extend block to $tag->blockNum pages with zero-values
 static void
 polar_extend_block_if_not_exist(BufferTag* tag) 
 {
@@ -179,6 +183,8 @@ polar_extend_block_if_not_exist(BufferTag* tag)
 	}
 }
 
+//XI: Call polar_idx_redo function in the corresponding resource manager
+//XI: If redo function is NULL, PANIC
 void
 polar_logindex_apply_one_record(polar_logindex_redo_ctl_t instance, XLogReaderState *state, BufferTag *tag, Buffer *buffer)
 {
@@ -202,6 +208,7 @@ polar_logindex_apply_one_record(polar_logindex_redo_ctl_t instance, XLogReaderSt
 	polar_idx_redo[state->decoded_record->xl_rmid].rm_polar_idx_redo(instance, state, tag, buffer);
 }
 
+//XI: Normally readding xlog to ReaderState
 XLogRecord *
 polar_logindex_read_xlog(XLogReaderState *state, XLogRecPtr lsn)
 {
@@ -227,6 +234,9 @@ polar_logindex_read_xlog(XLogReaderState *state, XLogRecPtr lsn)
 	return record;
 }
 
+//XI: Create a fake relation entry in relation cache
+//XI: The vm_pin will pin the vm page contain the $rnode page
+//XI: vm_pin will read the vm page to $buf
 static Buffer
 polar_read_vm_buffer(BufferTag *heap_tag)
 {
@@ -240,6 +250,7 @@ polar_read_vm_buffer(BufferTag *heap_tag)
 	return buf;
 }
 
+//XI: Add OUTDATE flag to BufferDesc->polar_redo_state
 Buffer
 polar_logindex_outdate_parse(polar_logindex_redo_ctl_t instance, XLogReaderState *state, BufferTag *heap_tag,
 							 bool get_cleanup_lock, polar_page_lock_t *page_lock, bool vm_parse)
@@ -251,6 +262,7 @@ polar_logindex_outdate_parse(polar_logindex_redo_ctl_t instance, XLogReaderState
 	BufferTag   vm_tag;
 	BufferTag   *tag;
 
+    //XI: if the $vm_parse is setted, then set $tag as $vm_tag
 	if (!vm_parse)
 		tag = heap_tag;
 	else
@@ -277,6 +289,7 @@ polar_logindex_outdate_parse(polar_logindex_redo_ctl_t instance, XLogReaderState
 		polar_pin_buffer(buf_desc, NULL);
 		LWLockRelease(partition_lock);
 
+        //XI: Set POLAR_REDO_LOCKED flag to buf_desc->polar_redo_state
 		redo_state = polar_lock_redo_state(buf_desc);
 
 		/*
@@ -288,10 +301,13 @@ polar_logindex_outdate_parse(polar_logindex_redo_ctl_t instance, XLogReaderState
 		if (!(redo_state & POLAR_REDO_READ_IO_END) ||
 				((redo_state & POLAR_REDO_REPLAYING) && !get_cleanup_lock))
 		{
+            //XI: If this page is not in the buffer, or is replaying by other processes, just mark it as OUTDATED
 			redo_state |= POLAR_REDO_OUTDATE;
 			polar_unlock_redo_state(buf_desc, redo_state);
 
 			ReleaseBuffer(BufferDescriptorGetBuffer(buf_desc));
+            //XI: Set instance->mini_trans->info[$page_lock -1].added = true;
+            //XI: Add this page@LSN to LogIndex
 			POLAR_LOGINDEX_MINI_TRANS_ADD_LSN(instance->wal_logindex_snapshot,
 											  instance->mini_trans, *page_lock, state, tag);
 		}
@@ -300,6 +316,8 @@ polar_logindex_outdate_parse(polar_logindex_redo_ctl_t instance, XLogReaderState
 			polar_unlock_redo_state(buf_desc, redo_state);
 			polar_logindex_mini_trans_unlock(instance->mini_trans, *page_lock);
 
+            //XI: Read data to Buffer
+            //XI: We found this page in buffer, why we read it again
 			if (!vm_parse)
 				buffer = XLogReadBufferExtended(tag->rnode, tag->forkNum, tag->blockNum, RBM_NORMAL_NO_LOG);
 			else
@@ -404,6 +422,7 @@ polar_logindex_parse_tag(polar_logindex_redo_ctl_t instance, XLogReaderState *st
 	polar_logindex_mini_trans_unlock(instance->mini_trans, page_lock);
 }
 
+//XI: Save this XlogRecord $block_id block into wal_logindex_snapshot or fullpage_logindex_snapshot
 void
 polar_logindex_save_block(polar_logindex_redo_ctl_t instance, XLogReaderState *state, uint8 block_id)
 {
@@ -437,6 +456,7 @@ polar_logindex_redo_parse(polar_logindex_redo_ctl_t instance, XLogReaderState *s
 	polar_logindex_parse_tag(instance, state, &tag, false);
 }
 
+//XI: TODO
 void
 polar_logindex_cleanup_parse(polar_logindex_redo_ctl_t instance, XLogReaderState *state, uint8 block_id)
 {
@@ -446,6 +466,7 @@ polar_logindex_cleanup_parse(polar_logindex_redo_ctl_t instance, XLogReaderState
 	polar_logindex_parse_tag(instance, state, &tag, true);
 }
 
+//XI: Call resource manager rm_polar_idx_save
 void
 polar_logindex_save_lsn(polar_logindex_redo_ctl_t instance, XLogReaderState *state)
 {
@@ -488,12 +509,19 @@ polar_logindex_redo_parse_start_lsn(polar_logindex_redo_ctl_t instance)
 	return polar_logindex_check_valid_start_lsn(instance->wal_logindex_snapshot);
 }
 
+//XI: If it's in replica mode, start the mini-transaction, and run polar_idx_parse function.
+//XI:   Else, run polar_idx_save function
+//XI: The return value is about whether do redo (if this log's LSN < restart_lsn, then redo=true)
+//XI: How the caller uses this return value ?? TODO
+//XI: Normally, if this function can parse this xlog successfully, then return value is TRUE, and startup will not redo it using rm_redo
+//XI:   If this xlog doesn't have matching resource_mgr, or parse failed, then using rm_redo immediately
 bool
 polar_logindex_parse_xlog(polar_logindex_redo_ctl_t instance, RmgrId rmid, XLogReaderState *state, XLogRecPtr redo_start_lsn, XLogRecPtr *mini_trans_lsn)
 {
 	bool redo = false;
 	static bool parse_valid = false;
 
+    //XI: if parse failed in the last time, this function will parse it again
 	if (unlikely(!parse_valid))
 	{
 		XLogRecPtr start_lsn = polar_logindex_redo_parse_start_lsn(instance);
@@ -555,6 +583,9 @@ polar_logindex_parse_xlog(polar_logindex_redo_ctl_t instance, RmgrId rmid, XLogR
 /*
  * POLAR: Apply the WAL record from start_lsn to end_lsn - 1.
  */
+//XI: This function will replay from start_lsn to end_lsn by calling rm_polar_idx_redo function
+//XI: It iterates xlog by creating LogIndex Iterator
+//XI: Return end_lsn
 XLogRecPtr
 polar_logindex_apply_page(polar_logindex_redo_ctl_t instance, XLogRecPtr start_lsn, XLogRecPtr end_lsn,
 						  BufferTag *tag, Buffer *buffer)
@@ -601,6 +632,7 @@ polar_logindex_apply_page(polar_logindex_redo_ctl_t instance, XLogRecPtr start_l
 	 * Logindex record the start position of XLOG and we search LSN between [start_lsn, end_lsn].
 	 * And end_lsn points to the end position of the last xlog, so we should subtract 1 here .
 	 */
+    //XI: todo Read how to create page iterator
 	wal_page_iter = polar_logindex_create_page_iterator(instance->wal_logindex_snapshot,
 														tag, start_lsn, end_lsn - 1, polar_get_bg_redo_state(instance) == POLAR_BG_ONLINE_PROMOTE);
 
@@ -620,6 +652,9 @@ polar_logindex_apply_page(polar_logindex_redo_ctl_t instance, XLogRecPtr start_l
 	return end_lsn;
 }
 
+//XI: apply page from $start_lsn, and this function will decide the end_lsn
+//XI: I think it will commonly replay all pages until the ReplayEndPtr
+//XI: Return the end_lsn
 static XLogRecPtr
 polar_logindex_apply_page_from(polar_logindex_redo_ctl_t instance, XLogRecPtr start_lsn, BufferTag *tag, Buffer *buffer, polar_page_lock_t page_lock)
 {
@@ -667,6 +702,7 @@ polar_logindex_apply_page_from(polar_logindex_redo_ctl_t instance, XLogRecPtr st
  * Search xlog base on the buffer tag and replay these xlog record for the buffer.
  * Return true if page lsn changed after replay
  */
+//XI: Redo xlog page until clear this page's OUTDATE flag
 bool
 polar_logindex_lock_apply_page_from(polar_logindex_redo_ctl_t instance, XLogRecPtr start_lsn, BufferTag *tag, Buffer *buffer)
 {
@@ -679,6 +715,7 @@ polar_logindex_lock_apply_page_from(polar_logindex_redo_ctl_t instance, XLogRecP
 
 	Assert(BufferIsValid(*buffer));
 
+    //XI: Record this buffer in the global variable
 	/*
 	 * Record the buffer that is replaying.If we abort transaction in
 	 * this backend process, we need to clear POLAR_REDO_REPLAYING from
@@ -697,6 +734,7 @@ polar_logindex_lock_apply_page_from(polar_logindex_redo_ctl_t instance, XLogRecP
 	 * We should finish reading data from storage and then replay xlog for page,
 	 * so we set redo_state to be POLAR_REDO_READ_IO_END | POLAR_REDO_REPLAYING.
 	 */
+    //XI: Update redo state
 	redo_state = polar_lock_redo_state(buf_hdr);
 	redo_state |= (POLAR_REDO_READ_IO_END | POLAR_REDO_REPLAYING);
 	redo_state &= (~POLAR_REDO_OUTDATE);
@@ -713,6 +751,8 @@ polar_logindex_lock_apply_page_from(polar_logindex_redo_ctl_t instance, XLogRecP
 
 		redo_state = polar_lock_redo_state(buf_hdr);
 
+        //XI: in the previous code, it cleared the OUTDATE flag.
+        //XI: It may set OUTDATE again by another process
 		if (redo_state & POLAR_REDO_OUTDATE)
 			redo_state &= (~POLAR_REDO_OUTDATE);
 		else
@@ -735,6 +775,7 @@ polar_logindex_lock_apply_page_from(polar_logindex_redo_ctl_t instance, XLogRecP
 	return PageGetLSN(page) != origin_lsn;
 }
 
+//XI: Promote makes a RO node to primary
 static void
 polar_promote_mark_buf_dirty(polar_logindex_redo_ctl_t instance, Buffer buffer, XLogRecPtr start_lsn)
 {
@@ -779,6 +820,8 @@ polar_promote_mark_buf_dirty(polar_logindex_redo_ctl_t instance, Buffer buffer, 
  * to avoid add lsn for this page.This is used when enable page invalid and
  * apply buffer when a backend process use this buffer.
  */
+//XI: Wrapper of polar_logindex_lock_apply_page_from
+//XI: Get bg_replayed_lsn as start_lsn, then lock&apply this page to the end_lsn
 void
 polar_logindex_lock_apply_buffer(polar_logindex_redo_ctl_t instance, Buffer *buffer)
 {
@@ -792,6 +835,7 @@ polar_logindex_lock_apply_buffer(polar_logindex_redo_ctl_t instance, Buffer *buf
 	{
 		SpinLockAcquire(&instance->info_lck);
 		bg_replayed_lsn = instance->bg_replayed_lsn;
+        //XI: TODO
 		POLAR_SET_BACKEND_READ_MIN_LSN(bg_replayed_lsn);
 		SpinLockRelease(&instance->info_lck);
 
@@ -825,6 +869,9 @@ polar_allocate_xlog_reader(void)
 	return state;
 }
 
+//XI: this function called by polar_logindex_apply_page()
+//XI: iter points to a record ready to replay, and it will iterate in range (startLSN, endLSN-1)
+//XI: call rm_polar_idx_redo
 static void
 polar_logindex_apply_one_page(polar_logindex_redo_ctl_t instance, BufferTag *tag, Buffer *buffer, log_index_page_iter_t iter)
 {
@@ -842,6 +889,7 @@ polar_logindex_apply_one_page(polar_logindex_redo_ctl_t instance, BufferTag *tag
 	while ((lsn_info = polar_logindex_page_iterator_next(iter)) != NULL)
 	{
 		polar_logindex_read_xlog(state, lsn_info->lsn);
+        //XI: call corresponding rm_polar_idx_redo function
 		polar_logindex_apply_one_record(instance, state, tag, buffer);
 
 		CHECK_FOR_INTERRUPTS();
@@ -850,6 +898,7 @@ polar_logindex_apply_one_page(polar_logindex_redo_ctl_t instance, BufferTag *tag
 	MemoryContextSwitchTo(oldcontext);
 }
 
+//XI: Create a bg replay control struct
 polar_logindex_bg_redo_ctl_t *
 polar_create_bg_redo_ctl(polar_logindex_redo_ctl_t instance, bool enable_processes_pool)
 {
@@ -914,6 +963,7 @@ polar_logindex_apply_xlog_background(polar_logindex_bg_redo_ctl_t *ctl)
 	if (unlikely(bg_redo_state == POLAR_BG_REDO_NOT_START || bg_redo_state == POLAR_BG_WAITING_RESET))
 		return true;
 
+    //XI: Get the last time replayed lsn
 	replayed_lsn = polar_get_last_replayed_read_ptr(ctl->instance);
 
 	/* Make sure there's room for us to pin buffer */
@@ -968,6 +1018,7 @@ polar_logindex_apply_xlog_background(polar_logindex_bg_redo_ctl_t *ctl)
  * put it back to free list. In other word, if the buffer is locked and pined
  * before this func, and it will be released and un-pined while being evicted.
  */
+//XI: Delete this buffer from buffer table and insert it to freelist
 static bool
 polar_evict_buffer(Buffer buffer)
 {
@@ -1046,6 +1097,7 @@ polar_bg_redo_read_record(XLogReaderState *state, XLogRecPtr lsn)
 	}
 }
 
+//XI: Given $bufferTag, get corresponding $block_id from XlogRecord
 static int
 polar_bg_redo_get_record_id(XLogReaderState *state, BufferTag *tag)
 {
@@ -1087,6 +1139,7 @@ polar_bg_redo_apply_read_record(polar_logindex_redo_ctl_t instance, XLogReaderSt
 		 * So during online promote when replay FPI xlog record, RBM_NORMAL_NO_LOG could return InvalidBuffer.
 		 * We use flag RBM_ZERO_ON_ERROR which will extend the file if page does not exist.
 		 */
+        //XI: (state)->blocks[block_id].apply_image
 		if (XLogRecBlockImageApply(state, blk_id))
 		{
 			LWLockAcquire(POLAR_REL_SIZE_CACHE_LOCK(instance->rel_size_cache), LW_SHARED);
@@ -1196,6 +1249,8 @@ polar_pin_buffer_for_replay(BufferTag *tag)
 	return InvalidBuffer;
 }
 
+//XI: Get buffer->page's status, also check its LSN.
+//XI: Determine whether this page need replay
 static buf_replay_stat_t
 polar_buffer_need_replay(polar_logindex_redo_ctl_t instance, Buffer buffer, XLogRecPtr lsn)
 {
@@ -1250,6 +1305,8 @@ polar_buffer_need_replay(polar_logindex_redo_ctl_t instance, Buffer buffer, XLog
  * If pinned buffer is invalid, buffer is doing io now. After io operation, page will be replayed,
  * so no need to replay it in background.
  */
+//XI: If this page is in buffer now, and it needs replay, replay it
+//XI: TODO what is primary_consist_ptr
 static void
 polar_only_replay_exists_buffer(polar_logindex_redo_ctl_t instance, XLogReaderState *state, log_index_lsn_t *log_index_page)
 {
@@ -1266,6 +1323,7 @@ polar_only_replay_exists_buffer(polar_logindex_redo_ctl_t instance, XLogReaderSt
 
 		if (stat == BUF_NEED_REPLAY)
 		{
+            //XI: Here is replica node, it gets consist LSN from WalRcv
 			XLogRecPtr consist_lsn = polar_get_primary_consist_ptr();
 
 			if (consist_lsn > log_index_page->lsn && polar_evict_buffer(buffer))
@@ -1321,6 +1379,7 @@ polar_min_xlog_rec_ptr(XLogRecPtr a, XLogRecPtr b)
 /*
  * POLAR: Lock redo state - set POLAR_REDO_LOCKED in redo state
  */
+//XI: set desc->polar_redo_state |= POLAR_REDO_LOCKED
 uint32
 polar_lock_redo_state(BufferDesc *desc)
 {
@@ -1664,9 +1723,12 @@ polar_logindex_redo_init(polar_logindex_redo_ctl_t instance, XLogRecPtr checkpoi
 	return start_lsn;
 }
 
+//XI: Flush fullpage_logindex_snapshot and wal_logindex_snapshot
+//XI: replica won't flush data
 void
 polar_logindex_redo_flush_data(polar_logindex_redo_ctl_t instance, XLogRecPtr checkpoint_lsn)
 {
+    //XI: replica won't flush data
 	if (polar_in_replica_mode() || !instance)
 		return ;
 
@@ -1976,6 +2038,7 @@ polar_logindex_io_lock_apply(polar_logindex_redo_ctl_t instance, BufferDesc *buf
  * 2. Remove unnecessary data from xlog queue
  * 3. Flush fullpage active logindex table
  */
+//XI: TODO
 void
 polar_logindex_rw_save(polar_logindex_redo_ctl_t instance)
 {
@@ -2180,7 +2243,7 @@ polar_logindex_require_backend_redo(polar_logindex_redo_ctl_t instance, ForkNumb
 	return required;
 }
 
-/*
+/*!
  * POLAR: set valid information to enable logindex parse.
  * set it only when logindex snapshot state is writable in current node.
  * For Primary/Standby node, logindex snapshot is writable
